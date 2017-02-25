@@ -174,7 +174,7 @@ bool obs_source_init(struct obs_source *source)
 	source->control = bzalloc(sizeof(obs_weak_source_t));
 	source->deinterlace_top_first = true;
 	source->control->source = source;
-	source->audio_mixers = 0xF;
+	source->audio_mixers = 0xFF;
 
 	if (is_audio_source(source)) {
 		pthread_mutex_lock(&obs->data.audio_sources_mutex);
@@ -502,6 +502,8 @@ void obs_source_destroy(struct obs_source *source)
 		source->info.destroy(source->context.data);
 		source->context.data = NULL;
 	}
+
+	audio_monitor_destroy(source->monitor);
 
 	obs_hotkey_unregister(source->push_to_talk_key);
 	obs_hotkey_unregister(source->push_to_mute_key);
@@ -1050,7 +1052,7 @@ static void handle_ts_jump(obs_source_t *source, uint64_t expected,
 }
 
 static void source_signal_audio_data(obs_source_t *source,
-		struct audio_data *in, bool muted)
+		const struct audio_data *in, bool muted)
 {
 	pthread_mutex_lock(&source->audio_cb_mutex);
 
@@ -1184,6 +1186,7 @@ static void source_output_audio_data(obs_source_t *source,
 			in.timestamp = source->next_audio_ts_min;
 	}
 
+	source->last_audio_ts = in.timestamp;
 	source->next_audio_ts_min = in.timestamp +
 		conv_frames_to_time(sample_rate, in.frames);
 
@@ -1226,14 +1229,16 @@ static void source_output_audio_data(obs_source_t *source,
 		source->last_sync_offset = sync_offset;
 	}
 
-	if (push_back && source->audio_ts)
-		source_output_audio_push_back(source, &in);
-	else
-		source_output_audio_place(source, &in);
+	if (source->monitoring_type != OBS_MONITORING_TYPE_MONITOR_ONLY) {
+		if (push_back && source->audio_ts)
+			source_output_audio_push_back(source, &in);
+		else
+			source_output_audio_place(source, &in);
+	}
 
 	pthread_mutex_unlock(&source->audio_buf_mutex);
 
-	source_signal_audio_data(source, &in, source_muted(source, os_time));
+	source_signal_audio_data(source, data, source_muted(source, os_time));
 }
 
 enum convert_type {
@@ -2172,6 +2177,7 @@ static void copy_frame_data(struct obs_source_frame *dst,
 	case VIDEO_FORMAT_BGRA:
 	case VIDEO_FORMAT_BGRX:
 		copy_frame_data_plane(dst, src, 0, dst->height);
+		break;
 
 	case VIDEO_FORMAT_Y800:
 		copy_frame_data_y800(dst, src);
@@ -2512,6 +2518,7 @@ static bool ready_async_frame(obs_source_t *source, uint64_t sys_time)
 			next_frame = source->async_frames.array[0];
 		}
 
+		source->last_frame_ts = next_frame->timestamp;
 		return true;
 	}
 
@@ -2967,19 +2974,19 @@ struct source_enum_data {
 	void *param;
 };
 
-static void enum_source_tree_callback(obs_source_t *parent, obs_source_t *child,
-		void *param)
+static void enum_source_active_tree_callback(obs_source_t *parent,
+		obs_source_t *child, void *param)
 {
 	struct source_enum_data *data = param;
 	bool is_transition = child->info.type == OBS_SOURCE_TYPE_TRANSITION;
 
 	if (is_transition)
 		obs_transition_enum_sources(child,
-				enum_source_tree_callback, param);
+				enum_source_active_tree_callback, param);
 	if (child->info.enum_active_sources) {
 		if (child->context.data) {
 			child->info.enum_active_sources(child->context.data,
-					enum_source_tree_callback, data);
+					enum_source_active_tree_callback, data);
 		}
 	}
 
@@ -3026,11 +3033,67 @@ void obs_source_enum_active_tree(obs_source_t *source,
 	obs_source_addref(source);
 
 	if (source->info.type == OBS_SOURCE_TYPE_TRANSITION)
-		obs_transition_enum_sources(source, enum_source_tree_callback,
-				&data);
+		obs_transition_enum_sources(source,
+				enum_source_active_tree_callback, &data);
 	if (source->info.enum_active_sources)
 		source->info.enum_active_sources(source->context.data,
-				enum_source_tree_callback, &data);
+				enum_source_active_tree_callback, &data);
+
+	obs_source_release(source);
+}
+
+static void enum_source_full_tree_callback(obs_source_t *parent,
+		obs_source_t *child, void *param)
+{
+	struct source_enum_data *data = param;
+	bool is_transition = child->info.type == OBS_SOURCE_TYPE_TRANSITION;
+
+	if (is_transition)
+		obs_transition_enum_sources(child,
+				enum_source_full_tree_callback, param);
+	if (child->info.enum_all_sources) {
+		if (child->context.data) {
+			child->info.enum_active_sources(child->context.data,
+					enum_source_full_tree_callback, data);
+		}
+	} else if (child->info.enum_active_sources) {
+		if (child->context.data) {
+			child->info.enum_active_sources(child->context.data,
+					enum_source_full_tree_callback, data);
+		}
+	}
+
+	data->enum_callback(parent, child, data->param);
+}
+
+static void obs_source_enum_full_tree(obs_source_t *source,
+		obs_source_enum_proc_t enum_callback,
+		void *param)
+{
+	struct source_enum_data data = {enum_callback, param};
+	bool is_transition;
+
+	if (!data_valid(source, "obs_source_enum_active_tree"))
+		return;
+
+	is_transition = source->info.type == OBS_SOURCE_TYPE_TRANSITION;
+	if (!is_transition && !source->info.enum_active_sources)
+		return;
+
+	obs_source_addref(source);
+
+	if (source->info.type == OBS_SOURCE_TYPE_TRANSITION)
+		obs_transition_enum_sources(source,
+				enum_source_full_tree_callback, &data);
+
+	if (source->info.enum_all_sources) {
+		source->info.enum_all_sources(source->context.data,
+				enum_source_full_tree_callback, &data);
+
+	} else if (source->info.enum_active_sources) {
+		source->info.enum_active_sources(source->context.data,
+				enum_source_full_tree_callback, &data);
+	}
 
 	obs_source_release(source);
 }
@@ -3062,7 +3125,7 @@ bool obs_source_add_active_child(obs_source_t *parent, obs_source_t *child)
 		return false;
 	}
 
-	obs_source_enum_active_tree(child, check_descendant, &info);
+	obs_source_enum_full_tree(child, check_descendant, &info);
 	if (info.exists)
 		return false;
 
@@ -3832,4 +3895,39 @@ void obs_source_remove_audio_capture_callback(obs_source_t *source,
 	pthread_mutex_lock(&source->audio_cb_mutex);
 	da_erase_item(source->audio_cb_list, &info);
 	pthread_mutex_unlock(&source->audio_cb_mutex);
+}
+
+void obs_source_set_monitoring_type(obs_source_t *source,
+		enum obs_monitoring_type type)
+{
+	bool was_on;
+	bool now_on;
+
+	if (!obs_source_valid(source, "obs_source_set_monitoring_type"))
+		return;
+	if (source->info.output_flags & OBS_SOURCE_DO_NOT_MONITOR)
+		return;
+	if (source->monitoring_type == type)
+		return;
+
+	was_on = source->monitoring_type != OBS_MONITORING_TYPE_NONE;
+	now_on = type != OBS_MONITORING_TYPE_NONE;
+
+	if (was_on != now_on) {
+		if (!was_on) {
+			source->monitor = audio_monitor_create(source);
+		} else {
+			audio_monitor_destroy(source->monitor);
+			source->monitor = NULL;
+		}
+	}
+
+	source->monitoring_type = type;
+}
+
+enum obs_monitoring_type obs_source_get_monitoring_type(
+		const obs_source_t *source)
+{
+	return obs_source_valid(source, "obs_source_get_monitoring_type") ?
+		source->monitoring_type : OBS_MONITORING_TYPE_NONE;
 }

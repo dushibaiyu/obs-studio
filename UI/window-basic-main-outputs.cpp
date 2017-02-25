@@ -665,9 +665,17 @@ bool SimpleOutput::StartStreaming(obs_service_t *service)
 			"DelayPreserve");
 	const char *bindIP = config_get_string(main->Config(), "Output",
 			"BindIP");
+	bool enableNewSocketLoop = config_get_bool(main->Config(), "Output",
+			"NewSocketLoopEnable");
+	bool enableLowLatencyMode = config_get_bool(main->Config(), "Output",
+			"LowLatencyEnable");
 
 	obs_data_t *settings = obs_data_create();
 	obs_data_set_string(settings, "bind_ip", bindIP);
+	obs_data_set_bool(settings, "new_socket_loop_enabled",
+			enableNewSocketLoop);
+	obs_data_set_bool(settings, "low_latency_mode_enabled",
+			enableLowLatencyMode);
 	obs_output_update(streamOutput, settings);
 	obs_data_release(settings);
 
@@ -837,8 +845,13 @@ bool SimpleOutput::StartRecording()
 	UpdateRecording();
 	if (!ConfigureRecording(false))
 		return false;
-	if (!obs_output_start(fileOutput))
+	if (!obs_output_start(fileOutput))  {
+		QMessageBox::critical(main,
+				QTStr("Output.StartRecordingFailed"),
+				QTStr("Output.StartFailedGeneric"));
 		return false;
+	}
+
 	return true;
 }
 
@@ -847,8 +860,13 @@ bool SimpleOutput::StartReplayBuffer()
 	UpdateRecording();
 	if (!ConfigureRecording(true))
 		return false;
-	if (!obs_output_start(replayBuffer))
+	if (!obs_output_start(replayBuffer)) {
+		QMessageBox::critical(main,
+				QTStr("Output.StartReplayFailed"),
+				QTStr("Output.StartFailedGeneric"));
 		return false;
+	}
+
 	return true;
 }
 
@@ -894,7 +912,7 @@ bool SimpleOutput::ReplayBufferActive() const
 /* ------------------------------------------------------------------------ */
 
 struct AdvancedOutput : BasicOutputHandler {
-	OBSEncoder             aacTrack[4];
+	OBSEncoder             aacTrack[MAX_AUDIO_MIXES];
 	OBSEncoder             h264Streaming;
 	OBSEncoder             h264Recording;
 
@@ -902,7 +920,7 @@ struct AdvancedOutput : BasicOutputHandler {
 	bool                   ffmpegRecording;
 	bool                   useStreamEncoder;
 
-	string                 aacEncoderID[4];
+	string                 aacEncoderID[MAX_AUDIO_MIXES];
 
 	AdvancedOutput(OBSBasic *main_);
 
@@ -999,7 +1017,7 @@ AdvancedOutput::AdvancedOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 		      "(advanced output)";
 	obs_encoder_release(h264Streaming);
 
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
 		char name[9];
 		sprintf(name, "adv_aac%d", i);
 
@@ -1094,7 +1112,7 @@ inline void AdvancedOutput::SetupStreaming()
 		for (; i < trackCount; i++)
 			obs_output_set_audio_encoder(streamOutput, aacTrack[i],
 					i);
-		for (; i < 4; i++)
+		for (; i < MAX_AUDIO_MIXES; i++)
 			obs_output_set_audio_encoder(streamOutput, nullptr, i);
 
 	} else {
@@ -1219,31 +1237,30 @@ static inline void SetEncoderName(obs_encoder_t *encoder, const char *name,
 
 inline void AdvancedOutput::UpdateAudioSettings()
 {
-	const char *name1 = config_get_string(main->Config(), "AdvOut",
-			"Track1Name");
-	const char *name2 = config_get_string(main->Config(), "AdvOut",
-			"Track2Name");
-	const char *name3 = config_get_string(main->Config(), "AdvOut",
-			"Track3Name");
-	const char *name4 = config_get_string(main->Config(), "AdvOut",
-			"Track4Name");
 	bool applyServiceSettings = config_get_bool(main->Config(), "AdvOut",
 			"ApplyServiceSettings");
 	int streamTrackIndex = config_get_int(main->Config(), "AdvOut",
 			"TrackIndex");
-	obs_data_t *settings[4];
+	obs_data_t *settings[MAX_AUDIO_MIXES];
 
-	for (size_t i = 0; i < 4; i++) {
+	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
 		settings[i] = obs_data_create();
 		obs_data_set_int(settings[i], "bitrate", GetAudioBitrate(i));
 	}
 
-	SetEncoderName(aacTrack[0], name1, "Track1");
-	SetEncoderName(aacTrack[1], name2, "Track2");
-	SetEncoderName(aacTrack[2], name3, "Track3");
-	SetEncoderName(aacTrack[3], name4, "Track4");
+	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
+		string cfg_name = "Track";
+		cfg_name += to_string((int)i + 1);
+		cfg_name += "Name";
+		const char *name = config_get_string(main->Config(), "AdvOut",
+				cfg_name.c_str());
 
-	for (size_t i = 0; i < 4; i++) {
+		string def_name = "Track";
+		def_name += to_string((int)i + 1);
+		SetEncoderName(aacTrack[i], name, def_name.c_str());
+	}
+
+	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
 		if (applyServiceSettings && (int)(i + 1) == streamTrackIndex)
 			obs_service_apply_encoder_settings(main->GetService(),
 					nullptr, settings[i]);
@@ -1258,10 +1275,8 @@ void AdvancedOutput::SetupOutputs()
 	obs_encoder_set_video(h264Streaming, obs_get_video());
 	if (h264Recording)
 		obs_encoder_set_video(h264Recording, obs_get_video());
-	obs_encoder_set_audio(aacTrack[0], obs_get_audio());
-	obs_encoder_set_audio(aacTrack[1], obs_get_audio());
-	obs_encoder_set_audio(aacTrack[2], obs_get_audio());
-	obs_encoder_set_audio(aacTrack[3], obs_get_audio());
+	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++)
+		obs_encoder_set_audio(aacTrack[i], obs_get_audio());
 
 	SetupStreaming();
 
@@ -1273,9 +1288,10 @@ void AdvancedOutput::SetupOutputs()
 
 int AdvancedOutput::GetAudioBitrate(size_t i) const
 {
-	const char *names[] = {
+	static const char *names[] = {
 		"Track1Bitrate", "Track2Bitrate",
 		"Track3Bitrate", "Track4Bitrate",
+		"Track5Bitrate", "Track6Bitrate",
 	};
 	int bitrate = (int)config_get_uint(main->Config(), "AdvOut", names[i]);
 	return FindClosestAvailableAACBitrate(bitrate);
@@ -1306,9 +1322,17 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 			"DelayPreserve");
 	const char *bindIP = config_get_string(main->Config(), "Output",
 			"BindIP");
+	bool enableNewSocketLoop = config_get_bool(main->Config(), "Output",
+			"NewSocketLoopEnable");
+	bool enableLowLatencyMode = config_get_bool(main->Config(), "Output",
+			"LowLatencyEnable");
 
 	obs_data_t *settings = obs_data_create();
 	obs_data_set_string(settings, "bind_ip", bindIP);
+	obs_data_set_bool(settings, "new_socket_loop_enabled",
+			enableNewSocketLoop);
+	obs_data_set_bool(settings, "low_latency_mode_enabled",
+			enableLowLatencyMode);
 	obs_output_update(streamOutput, settings);
 	obs_data_release(settings);
 
@@ -1401,11 +1425,14 @@ bool AdvancedOutput::StartRecording()
 		obs_data_release(settings);
 	}
 
-	if (obs_output_start(fileOutput)) {
-		return true;
+	if (!obs_output_start(fileOutput)) {
+		QMessageBox::critical(main,
+				QTStr("Output.StartRecordingFailed"),
+				QTStr("Output.StartFailedGeneric"));
+		return false;
 	}
 
-	return false;
+	return true;
 }
 
 void AdvancedOutput::StopStreaming(bool force)

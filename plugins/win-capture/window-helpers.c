@@ -128,6 +128,33 @@ void get_window_class(struct dstr *class, HWND hwnd)
 		dstr_from_wcs(class, temp);
 }
 
+/* not capturable or internal windows */
+static const char *internal_microsoft_exes[] = {
+	"applicationframehost",
+	"shellexperiencehost",
+	"winstore.app",
+	"searchui",
+	NULL
+};
+
+static bool is_microsoft_internal_window_exe(const char *exe)
+{
+	char cur_exe[MAX_PATH];
+
+	if (!exe)
+		return false;
+
+	for (const char **vals = internal_microsoft_exes; *vals; vals++) {
+		strcpy(cur_exe, *vals);
+		strcat(cur_exe, ".exe");
+
+		if (strcmpi(cur_exe, exe) == 0)
+			return true;
+	}
+
+	return false;
+}
+
 static void add_window(obs_property_t *p, HWND hwnd, add_window_cb callback)
 {
 	struct dstr class   = {0};
@@ -138,6 +165,10 @@ static void add_window(obs_property_t *p, HWND hwnd, add_window_cb callback)
 
 	if (!get_window_exe(&exe, hwnd))
 		return;
+	if (is_microsoft_internal_window_exe(exe.array)) {
+		dstr_free(&exe);
+		return;
+	}
 	get_window_title(&title, hwnd);
 	get_window_class(&class, hwnd);
 
@@ -209,7 +240,7 @@ HWND get_uwp_actual_window(HWND parent)
 	HWND child;
 
 	GetWindowThreadProcessId(parent, &parent_id);
-	child = GetWindow(parent, GW_CHILD);
+	child = FindWindowEx(parent, NULL, NULL, NULL);
 
 	while (child) {
 		DWORD child_id = 0;
@@ -218,14 +249,14 @@ HWND get_uwp_actual_window(HWND parent)
 		if (child_id != parent_id)
 			return child;
 
-		child = GetNextWindow(child, GW_HWNDNEXT);
+		child = FindWindowEx(parent, child, NULL, NULL);
 	}
 
 	return NULL;
 }
 
-static inline HWND next_window(HWND window, enum window_search_mode mode,
-		HWND *parent)
+static HWND next_window(HWND window, enum window_search_mode mode,
+		HWND *parent, bool use_findwindowex)
 {
 	if (*parent) {
 		window = *parent;
@@ -233,7 +264,12 @@ static inline HWND next_window(HWND window, enum window_search_mode mode,
 	}
 
 	while (true) {
-		window = GetNextWindow(window, GW_HWNDNEXT);
+		if (use_findwindowex)
+			window = FindWindowEx(GetDesktopWindow(), window, NULL,
+					NULL);
+		else
+			window = GetNextWindow(window, GW_HWNDNEXT);
+
 		if (!window || check_window_valid(window, mode))
 			break;
 	}
@@ -249,14 +285,32 @@ static inline HWND next_window(HWND window, enum window_search_mode mode,
 	return window;
 }
 
-static inline HWND first_window(enum window_search_mode mode, HWND *parent)
+static HWND first_window(enum window_search_mode mode, HWND *parent,
+		bool *use_findwindowex)
 {
-	HWND window = GetWindow(GetDesktopWindow(), GW_CHILD);
+	HWND window = FindWindowEx(GetDesktopWindow(), NULL, NULL, NULL);
+
+	if (!window) {
+		*use_findwindowex = false;
+		window = GetWindow(GetDesktopWindow(), GW_CHILD);
+	} else {
+		*use_findwindowex = true;
+	}
 
 	*parent = NULL;
 
-	if (!check_window_valid(window, mode))
-		window = next_window(window, mode, parent);
+	if (!check_window_valid(window, mode)) {
+		window = next_window(window, mode, parent, *use_findwindowex);
+
+		if (!window && *use_findwindowex) {
+			*use_findwindowex = false;
+
+			window = GetWindow(GetDesktopWindow(), GW_CHILD);
+			if (!check_window_valid(window, mode))
+				window = next_window(window, mode, parent,
+						*use_findwindowex);
+		}
+	}
 
 	if (is_uwp_window(window)) {
 		HWND child = get_uwp_actual_window(window);
@@ -273,11 +327,13 @@ void fill_window_list(obs_property_t *p, enum window_search_mode mode,
 		add_window_cb callback)
 {
 	HWND parent;
-	HWND window = first_window(mode, &parent);
+	bool use_findwindowex = false;
+
+	HWND window = first_window(mode, &parent, &use_findwindowex);
 
 	while (window) {
 		add_window(p, window, callback);
-		window = next_window(window, mode, &parent);
+		window = next_window(window, mode, &parent, use_findwindowex);
 	}
 }
 
@@ -335,9 +391,15 @@ HWND find_window(enum window_search_mode mode,
 		const char *exe)
 {
 	HWND parent;
-	HWND window      = first_window(mode, &parent);
+	bool use_findwindowex = false;
+
+	HWND window      = first_window(mode, &parent, &use_findwindowex);
 	HWND best_window = NULL;
 	int  best_rating = 0;
+
+	if (!class)
+		return NULL;
+
 	bool uwp_window  = strcmp(class, "Windows.UI.Core.CoreWindow") == 0;
 
 	while (window) {
@@ -348,7 +410,7 @@ HWND find_window(enum window_search_mode mode,
 			best_window = window;
 		}
 
-		window = next_window(window, mode, &parent);
+		window = next_window(window, mode, &parent, use_findwindowex);
 	}
 
 	return best_window;

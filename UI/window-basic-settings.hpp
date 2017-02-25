@@ -240,6 +240,7 @@ private:
 
 	void FillSimpleRecordingValues();
 	void FillSimpleStreamingValues();
+	void FillAudioMonitoringDevices();
 
 	void RecalcOutputResPixels(const char *resText);
 
@@ -283,6 +284,8 @@ private slots:
 	void AdvancedChangedRestart();
 
 	void UpdateStreamDelayEstimate();
+
+	void UpdateAutomaticReplayBufferCheckboxes();
 
 	void AdvOutRecCheckWarnings();
 
